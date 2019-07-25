@@ -1,21 +1,34 @@
 from __future__ import division
+
+import os
+import re
 import json
-import petl as etl
-import xmltodict
+# import pytz
 import logging
 import psycopg2
-import pytz
-import re
-import os
+import xmltodict
+import petl as etl
 
+import intervals as I  # noqa: F401, E741
+from time import sleep
+import sqlalchemy as sq
 from datetime import datetime
 from collections import OrderedDict
-from time import sleep
 from psycopg2.extras import execute_values
-import intervals as I  # noqa: F401, E741
-# import itertools
+from sqlalchemy import create_engine, MetaData
+# from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.ext.declarative import declarative_base
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+Base = declarative_base(
+    metadata=MetaData(
+        schema='warehouse'
+    )
+)
 
 
 class XMLHelper(object):
@@ -46,7 +59,7 @@ class XMLHelper(object):
 class dBConnection(object):
 
     @classmethod
-    def db_connect(cls, host, user, password, db_name, db_schema):
+    def connect(cls, host, user, password, db_name, db_schema):
         config = {
             'host': host,
             'user': user,
@@ -57,12 +70,51 @@ class dBConnection(object):
         return psycopg2.connect(**config)
 
 
+class Model():
+    class BaseModel(object):
+        __table_args__ = {
+            'useexisting': True
+        }
+
+    class Rooms(Base, BaseModel):
+        __tablename__ = 'rooms'
+        room_id = sq.Column(sq.String(32), primary_key=True)
+        create_at = sq.Column(sq.Interval())
+        end_time = sq.Column(sq.Interval())
+        creator = sq.Column(sq.BigInteger)
+
+    class Participations(Base, BaseModel):
+        __tablename__ = 'participations'
+        p_id = sq.Column(sq.BigInteger, primary_key=True, autoincrement=True)
+        room_id = sq.Column(sq.String(32), sq.ForeignKey("rooms.room_id"))
+        participant_id = sq.Column(sq.String(32), nullable=False)
+        start_time = sq.Column(sq.BigInteger, nullable=False)
+        end_time = sq.Column(sq.BigInteger, nullable=False)
+        role = sq.Column(sq.String(32))
+        init_time = sq.Column(sq.BigInteger)
+        reason_for_leaving = sq.Column(sq.String(32))
+
+    @classmethod
+    def connection(cls, config):
+        destination_db_engine = create_engine(
+            'postgresql://{}:{}@{}:{}/{}'.format(
+                config['user'],
+                config['password'],
+                config['host'],
+                '5432',
+                config['dbname'],
+            ),
+            connect_args={'connect_timeout': 3600}
+        )
+        Base.metadata.create_all(destination_db_engine)
+
+
 class Loader(object):
 
-    def __init__(self, connection, truncate=True):
+    def __init__(self, connection, truncate=False):
         self.conn = connection
         if truncate:
-            for tablename in ['calls', 'calls_details']:
+            for tablename in ['participations', 'rooms']:
                 self.truncate_table(tablename)
 
     def truncate_table(self, tablename):
@@ -79,54 +131,50 @@ class Loader(object):
             return None
 
         cursor = self.conn.cursor()
-        calls = etl.cut(
+        rooms = etl.cut(
             data,
-            'id',
             'room_id',
-            'message_id',
-            'from_id',
-            'to_id',
-            'call_type',
-            'termination_reason'
-
+            'create_at',
+            'end_time',
+            # 'creator'
         )
-        call_details = etl.cut(
+        participations = etl.cut(
             data,
-            'id',
-            'participants'
+            'room_id',
+            'summary'
         )
-        call_detail_store = []
-        call_d = etl.data(call_details)
-        for c in call_d:
-            for k, v in c[1].iteritems():
-                call_detail_store.append(
-                    {
-                        'call_id': c[0],
-                        'initiated_time': v.get('initiatedTime', 0),
-                        'joined_time': v.get('joinedTime'),
-                        'user_id': k,
-                        'leave_time': v.get('leaveTime', 0),
-                        'duration': v.get('duration'),
-                        'role': v.get('role'),
-                    }
-                )
-        call_detail_store = etl.fromdicts(
-            call_detail_store,
+        participations_list = []
+        participations_list = etl.data(participations)
+        for (room_id, summary) in participations:
+            summary.pop('initiated_time')
+            for k, v in summary.iteritems():
+                for interval in v['interval']:
+                    participations_list.append(
+                        {
+                            'room_id': room_id,
+                            'participant_id': k,
+                            'start_time': min(interval),
+                            'end_time': max(interval),
+                            'role': v['role']
+                        }
+                    )
+        participations_list = etl.fromdicts(
+            participations_list,
             header=[
-                'call_id',
-                'initiated_time',
-                'joined_time',
-                'user_id',
-                'leave_time',
-                'duration',
-                'role'
+                'room_id',
+                'participant_id',
+                'start_time',
+                'end_time',
+                'role',
+                # 'init_time',
+                # 'eason_for_leaving'
             ]
         )
-        sql = "INSERT INTO %s (%s) " % ('calls', ','.join(etl.header(calls))) + "VALUES %s"
-        execute_values(cursor, sql, etl.data(calls))
+        sql = "INSERT INTO %s (%s) " % ('rooms', ','.join(etl.header(rooms))) + "VALUES %s"
+        execute_values(cursor, sql, etl.data(rooms))
 
-        sql = "INSERT INTO %s (%s) " % ('call_details', ','.join(etl.header(call_detail_store))) + "VALUES %s"
-        execute_values(cursor, sql, etl.data(call_detail_store))
+        sql = "INSERT INTO %s (%s) " % ('participations', ','.join(etl.header(participations_list))) + "VALUES %s"
+        execute_values(cursor, sql, etl.data(participations_list))
         self.conn.commit()
         self.conn.close()
 
@@ -141,12 +189,6 @@ def id_str_to_int(id_str):
     return int(id_str.split('@')[0]) if id_str.split('@')[0].isdigit() else None
 
 
-def call_duration(end_time, start_time):
-    return (
-        datetime.fromtimestamp(round(end_time / 1000)) - datetime.fromtimestamp(round(start_time / 1000))
-    ).total_seconds()
-
-
 def modified_participants(participants):
     participants_temp = participants
     for participant, summary in participants.iteritems():
@@ -155,9 +197,22 @@ def modified_participants(participants):
     return participants_temp
 
 
+def get_call_info(summaries):
+    min_interval, max_interval = [], []
+    for _, summary in summaries.iteritems():
+        for interval in summary['interval']:
+            min_interval.append(min(interval))
+            max_interval.append(max(interval))
+    print min_interval
+    return {
+        'create_at': min(min_interval),
+        'end_time': max(max_interval)
+    }
+
+
 def date_to_timestr(timestamp):
-    print 'timestamp {} -> type {}'. format(timestamp, type(timestamp))
-    return datetime.fromtimestamp(timestamp / 1000, tz=pytz.utc).strftime('%H:%M:%S.%f')
+    return timestamp
+    # return datetime.fromtimestamp(timestamp / 1000, tz=pytz.utc).strftime('%H:%M:%S.%f')
 
 
 def replace_calltime(participant_summary, timestamp):
@@ -172,16 +227,12 @@ def replace_calltime(participant_summary, timestamp):
 
 
 def merge_summaries(user_summary):
-    print 'user_summary -> ', user_summary
     summary_str = [
         I.closed(summary['joinedTime'], summary['leaveTime']) for summary in user_summary
     ]
-    # print 'summary -> ', summary_str
     final_summary = I.empty()
     for interval in summary_str:
         final_summary |= interval
-    print 'after merging'
-    print 'final_summary -> ', final_summary
     return final_summary
 
 
@@ -231,11 +282,20 @@ def group_participant_summary(summaries):
 
 
 if __name__ == "__main__":
+    Model().connection(
+        {
+            'host': '192.168.0.48',
+            'user': 'data_warehouse',
+            'password': None,
+            'dbname': 'data_warehouse',
+            'db_schema': 'warehouse'
+        }
+    )
     number_of_record = 0
     while True:
         data_loaded = load_file('./group_call.json')
         if len(data_loaded) <= number_of_record:
-            print "Continue to the next iteration .."
+            logging.info("Continue to the next iteration ..")
             sleep(10)
             continue
 
@@ -265,8 +325,6 @@ if __name__ == "__main__":
         # converted_data = etl.addfield(converted_data, 'participants', lambda r: r['txt']['participants'])
         converted_data = etl.addfield(converted_data, 'participants', lambda r: modified_participants(r['txt']['participants']))
         converted_data = etl.addfield(converted_data, 'timestamp_ms', lambda r: r['timestamp'] / 1000)
-        # converted_data = etl.addfield(converted_data, 'timestamp_str', lambda r: datetime.fromtimestamp(r['timestamp'] / 1000000, tz=pytz.utc).strftime('%Y-%m-%d %H:%M:%S.%f'))
-        # print converted_data
 
         aggregations = OrderedDict()
         aggregations['summary'] = ('participants', 'timestamp_ms'), group_participant_summary
@@ -275,9 +333,10 @@ if __name__ == "__main__":
             key=('room_id'),
             aggregation=aggregations
         )
-        aggregated_summary = etl.addfield(aggregated_summary, 'summary_to_unpack', lambda r: r['summary'])
-        aggregated_summary = etl.unpackdict(aggregated_summary, 'summary_to_unpack')
-        print aggregated_summary
+        # aggregated_summary = etl.addfield(aggregated_summary, 'call_info', lambda r: get_call_info(r['summary']))
+        # aggregated_summary = etl.unpackdict(aggregated_summary, 'call_info')
+        # aggregated_summary = etl.addfield(aggregated_summary, 'summary_to_unpack', lambda r: r['summary'])
+        # aggregated_summary = etl.unpackdict(aggregated_summary, 'summary_to_unpack')
         # TODO:
         # For each roomId and participants get all the interval associated with them
         #   - Loop for each summary, start with empty summary
@@ -292,5 +351,18 @@ if __name__ == "__main__":
         directory = 'csv'
         if not os.path.exists(directory):
             os.makedirs(directory)
-        etl.tocsv(aggregated_summary, './%s/%s' % (directory, file_name))
-        print 'This %s has been exported' % file_name
+        # etl.tocsv(aggregated_summary, './%s/%s' % (directory, file_name))
+        # logging.info('This %s has been exported' % file_name)
+        logging.info('Storing data %s to database' % file_name)
+        connection = dBConnection.connect(
+            host='192.168.0.48',
+            user='data_warehouse',
+            password=None,
+            db_name='data_warehouse',
+            db_schema='warehouse'
+        )
+        loader = Loader(
+            connection
+        )
+        loader.store_to_db(aggregated_summary)
+        logging.info('This %s has been stored' % file_name)
