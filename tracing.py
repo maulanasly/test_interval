@@ -81,7 +81,7 @@ class Model():
         room_id = sq.Column(sq.String(32), primary_key=True)
         create_at = sq.Column(sq.TIMESTAMP)
         end_time = sq.Column(sq.TIMESTAMP)
-        creator = sq.Column(sq.BigInteger)
+        creator = sq.Column(UUID())
 
     class Participations(Base, BaseModel):
         __tablename__ = 'participations'
@@ -151,15 +151,13 @@ def modified_participants(participants):
 
 
 def get_call_info(summaries):
-    min_interval, max_interval = [], []
+    max_interval = []
     for _, summary in summaries.iteritems():
         if 'interval' not in summary:
             continue
         for interval in summary['interval']:
-            min_interval.append(min(interval))
             max_interval.append(max(interval))
     return {
-        'create_at': min(min_interval),
         'end_time': max(max_interval)
     }
 
@@ -181,61 +179,71 @@ def replace_calltime(participant_summary, timestamp):
 
 
 def merge_summaries(user_summary):
-    summary_str = [
-        I.closed(summary['joinedTime'], summary['leaveTime']) for summary in user_summary
-    ]
     final_summary = I.empty()
-    for interval in summary_str:
+    for interval in [I.closed(summary['joinedTime'], summary['leaveTime']) for summary in user_summary]:
         final_summary |= interval
     return final_summary
 
 
 def combine_initiated_time(user_summary):
     return list(
-        set([
-            date_to_timestr(summary['initiatedTime']) for summary in user_summary
-        ])
+        set(
+            [date_to_timestr(summary['initiatedTime']) for summary in user_summary]
+        )
     )
 
 
 def format_interval(user_interval):
     return [
-        (date_to_timestr(interval.lower), date_to_timestr(interval.upper)) for interval in user_interval
+        (date_to_timestr(interval.lower), date_to_timestr(interval.upper))
+        for interval in user_interval
     ]
 
 
 def grouping_summary_by_room_id(summaries):
-    summaries_temp = {}
+    summaries_per_user = {}
     for (summary, timestamp) in summaries:
-        create_at = 0
         for user_id, participant_summary in summary.iteritems():
-            initiated_time = participant_summary.get('initiatedTime', 0)
-            create_at = create_at if create_at > initiated_time else initiated_time
             updated_participant_summary = replace_calltime(participant_summary, timestamp)
             if not updated_participant_summary:
                 continue
 
-            if user_id not in summaries_temp:
-                summaries_temp[user_id] = [updated_participant_summary]
+            if user_id not in summaries_per_user:
+                summaries_per_user[user_id] = [updated_participant_summary]
             else:
-                summaries_temp[user_id].append(updated_participant_summary)
+                summaries_per_user[user_id].append(updated_participant_summary)
     final_summaries = {}
-    for user_id, user_summary in summaries_temp.iteritems():
+    for user_id, user_summary in summaries_per_user.iteritems():
         final_summaries[user_id] = {
             'interval': format_interval(
                 merge_summaries(user_summary)
             ),
             'role': user_summary[0]['role'],
         }
-        # if 'initiated_time' not in final_summaries:
-        #     final_summaries['initiated_time'] = []
+        if 'initiated_time' not in final_summaries:
+            final_summaries['initiated_time'] = []
 
-        # final_summaries['initiated_time'].append(
-        #     {
-        #         user_id: combine_initiated_time(user_summary)
-        #     }
-        # )
+        final_summaries['initiated_time'].append(
+            {
+                user_id: combine_initiated_time(user_summary)
+            }
+        )
     return final_summaries
+
+
+def find_creator_and_create_at(summaries):
+    initiated_time_list = {}
+    for summary in summaries:
+        for user_id, participant_summary in summary.iteritems():
+            initiated_time = participant_summary.get('initiatedTime', 0)
+            if initiated_time == 0:
+                continue
+            initiated_time_list[initiated_time] = user_id
+    index = min(initiated_time_list)
+    return {
+        'creator': initiated_time_list[index],
+        'create_at': date_to_timestr(index)
+    }
 
 
 def storing_data_preparation(data):
@@ -248,15 +256,16 @@ def storing_data_preparation(data):
     participations_data = etl.data(participations_data)
     for (room_id, summary) in participations_data:
         summary.pop('initiated_time')
-        for k, v in summary.iteritems():
-            for interval in v['interval']:
+        for participant_id, summary_items in summary.iteritems():
+            for interval in summary_items['interval']:
+                start, end = interval
                 participations.append(
                     {
                         'room_id': room_id,
-                        'participant_id': k,
-                        'start_time': min(interval),
-                        'end_time': max(interval),
-                        'role': v['role']
+                        'participant_id': participant_id,
+                        'start_time': start,
+                        'end_time': end,
+                        'role': summary_items['role']
                     }
                 )
     rooms = etl.cut(
@@ -264,7 +273,7 @@ def storing_data_preparation(data):
         'room_id',
         'create_at',
         'end_time',
-        # 'creator'
+        'creator'
     )
     participations = etl.fromdicts(
         participations,
@@ -321,14 +330,12 @@ if __name__ == "__main__":
         converted_data = etl.addfield(converted_data, 'message_id', lambda r: r['xml']['id'])
         converted_data = etl.addfield(converted_data, 'termination_reason', lambda r: r['txt']['reasonOfTermination'])
         converted_data = etl.addfield(converted_data, 'call_type', lambda r: r['txt']['callType'])
-
-        # converted_data = etl.addfield(converted_data, 'participants', lambda r: r['txt']['participants'])
         converted_data = etl.addfield(converted_data, 'participants', lambda r: modified_participants(r['txt']['participants']))
         converted_data = etl.addfield(converted_data, 'timestamp_ms', lambda r: r['timestamp'] / 1000)
 
         aggregations = OrderedDict()
         aggregations['summary'] = ('participants', 'timestamp_ms'), grouping_summary_by_room_id
-        # aggregations['create_at'] = ('participants', 'timestamp_ms'), group_participant_summary
+        aggregations['creator_data'] = ('participants'), find_creator_and_create_at
         aggregated_summary = etl.aggregate(
             converted_data,
             key=('room_id'),
@@ -354,6 +361,7 @@ if __name__ == "__main__":
         )
         aggregated_summary = etl.addfield(aggregated_summary, 'call_info', lambda r: get_call_info(r['summary']))
         aggregated_summary = etl.unpackdict(aggregated_summary, 'call_info')
+        aggregated_summary = etl.unpackdict(aggregated_summary, 'creator_data')
 
         file_name = 'datasets-%s.csv' % datetime.now().strftime('%Y%m%d%H%M%S')
         directory = 'csv'
@@ -371,13 +379,18 @@ if __name__ == "__main__":
         )
         participations = etl.rename(participations, 'r_external_id', 'participant_id')
 
+        rooms = etl.leftjoin(rooms, external_ids, lkey='creator', rkey='id', rprefix='r_')
+        rooms = etl.cutout(
+            rooms,
+            'creator'
+        )
+        rooms = etl.rename(rooms, 'r_external_id', 'creator')
+
         logging.info('Storing data %s to database' % file_name)
         loader.truncate_table(dBConnection.connect(**config))
         loader.store_to_db(dBConnection.connect(**config), tablename='rooms', data=rooms)
         loader.store_to_db(dBConnection.connect(**config), tablename='participations', data=participations)
         logging.info('This %s has been stored' % file_name)
-        # aggregated_summary = etl.addfield(aggregated_summary, 'summary_to_unpack', lambda r: r['summary'])
-        # aggregated_summary = etl.unpackdict(aggregated_summary, 'summary_to_unpack')
         # TODO:
         # For each roomId and participants get all the interval associated with them
         #   - Loop for each summary, start with empty summary
