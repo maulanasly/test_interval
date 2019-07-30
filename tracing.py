@@ -9,7 +9,7 @@ import psycopg2
 import xmltodict
 import petl as etl
 
-import intervals as I  # noqa: F401, E741
+import intervals as Interval
 from time import sleep
 import sqlalchemy as sq
 from datetime import datetime
@@ -150,84 +150,34 @@ def modified_participants(participants):
     return participants_temp
 
 
-def get_call_info(summaries):
-    max_interval = []
-    for _, summary in summaries.iteritems():
-        if 'interval' not in summary:
-            continue
-        for interval in summary['interval']:
-            max_interval.append(max(interval))
+def get_summary_creation(summaries):
     return {
-        'end_time': max(max_interval)
+        'end_time': max(
+            [max(interval) for _, summary in summaries.iteritems() for interval in summary['interval'] if 'interval' in summary]
+        )
     }
 
 
-def date_to_timestr(timestamp):
-    # return timestamp
-    return datetime.fromtimestamp(timestamp / 1000, tz=pytz.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')
-
-
-def replace_calltime(participant_summary, timestamp):
-    # TODO:
-    # - Check the timezone information in all time attribute
-    if 'joinedTime' not in participant_summary:
-        return {}
-
-    if 'leaveTime' not in participant_summary:
-        participant_summary['leaveTime'] = timestamp
-    return participant_summary
-
-
-def merge_summaries(user_summary):
-    final_summary = I.empty()
-    for interval in [I.closed(summary['joinedTime'], summary['leaveTime']) for summary in user_summary]:
-        final_summary |= interval
-    return final_summary
-
-
-def combine_initiated_time(user_summary):
-    return list(
-        set(
-            [date_to_timestr(summary['initiatedTime']) for summary in user_summary]
-        )
-    )
-
-
-def format_interval(user_interval):
-    return [
-        (date_to_timestr(interval.lower), date_to_timestr(interval.upper))
-        for interval in user_interval
-    ]
-
-
 def grouping_summary_by_room_id(summaries):
-    summaries_per_user = {}
-    for (summary, timestamp) in summaries:
-        for user_id, participant_summary in summary.iteritems():
-            updated_participant_summary = replace_calltime(participant_summary, timestamp)
-            if not updated_participant_summary:
-                continue
-
-            if user_id not in summaries_per_user:
-                summaries_per_user[user_id] = [updated_participant_summary]
-            else:
-                summaries_per_user[user_id].append(updated_participant_summary)
     final_summaries = {}
-    for user_id, user_summary in summaries_per_user.iteritems():
+    for user_id, user_summary in group_summary_per_user(summaries).iteritems():
         final_summaries[user_id] = {
             'interval': format_interval(
-                merge_summaries(user_summary)
+                merge_summaries(user_summary, lower='joinedTime', upper='leaveTime')
             ),
             'role': user_summary[0]['role'],
         }
-        if 'initiated_time' not in final_summaries:
-            final_summaries['initiated_time'] = []
+    return final_summaries
 
-        final_summaries['initiated_time'].append(
-            {
-                user_id: combine_initiated_time(user_summary)
-            }
-        )
+
+def get_initiated_time_interval(summaries):
+    final_summaries = {}
+    for user_id, user_summary in group_summary_per_user(summaries).iteritems():
+        final_summaries[user_id] = {
+            'interval': format_interval(
+                merge_summaries(user_summary, lower='initiatedTime', upper='leaveTime')
+            )
+        }
     return final_summaries
 
 
@@ -246,6 +196,52 @@ def find_creator_and_create_at(summaries):
     }
 
 
+def date_to_timestr(timestamp):
+    return datetime.fromtimestamp(
+        timestamp / 1000, tz=pytz.utc
+    ).strftime('%Y-%m-%dT%H:%M:%S.%f')
+
+
+def replace_calltime(participant_summary, timestamp):
+    # TODO:
+    # - Check the timezone information in all time attribute
+    if 'joinedTime' not in participant_summary:
+        return {}
+
+    if 'leaveTime' not in participant_summary:
+        participant_summary['leaveTime'] = timestamp
+    return participant_summary
+
+
+def group_summary_per_user(summaries):
+    summaries_per_user = {}
+    for (summary, timestamp) in summaries:
+        for user_id, participant_summary in summary.iteritems():
+            updated_participant_summary = replace_calltime(participant_summary, timestamp)
+            if not updated_participant_summary:
+                continue
+
+            if user_id not in summaries_per_user:
+                summaries_per_user[user_id] = [updated_participant_summary]
+            else:
+                summaries_per_user[user_id].append(updated_participant_summary)
+    return summaries_per_user
+
+
+def merge_summaries(user_summary, lower, upper):
+    final_summary = Interval.empty()
+    for interval in [Interval.closed(summary[lower], summary[upper]) for summary in user_summary]:
+        final_summary |= interval
+    return final_summary
+
+
+def format_interval(user_interval):
+    return [
+        (date_to_timestr(interval.lower), date_to_timestr(interval.upper))
+        for interval in user_interval
+    ]
+
+
 def storing_data_preparation(data):
     participations_data = etl.cut(
         data,
@@ -255,16 +251,15 @@ def storing_data_preparation(data):
     participations = []
     participations_data = etl.data(participations_data)
     for (room_id, summary) in participations_data:
-        summary.pop('initiated_time')
         for participant_id, summary_items in summary.iteritems():
             for interval in summary_items['interval']:
-                start, end = interval
+                start_time, end_time = interval
                 participations.append(
                     {
                         'room_id': room_id,
                         'participant_id': participant_id,
-                        'start_time': start,
-                        'end_time': end,
+                        'start_time': start_time,
+                        'end_time': end_time,
                         'role': summary_items['role']
                     }
                 )
@@ -335,6 +330,7 @@ if __name__ == "__main__":
 
         aggregations = OrderedDict()
         aggregations['summary'] = ('participants', 'timestamp_ms'), grouping_summary_by_room_id
+        aggregations['initiated_time'] = ('participants', 'timestamp_ms'), get_initiated_time_interval
         aggregations['creator_data'] = ('participants'), find_creator_and_create_at
         aggregated_summary = etl.aggregate(
             converted_data,
@@ -359,7 +355,7 @@ if __name__ == "__main__":
             ],
             header=['id', 'external_id']
         )
-        aggregated_summary = etl.addfield(aggregated_summary, 'call_info', lambda r: get_call_info(r['summary']))
+        aggregated_summary = etl.addfield(aggregated_summary, 'call_info', lambda r: get_summary_creation(r['summary']))
         aggregated_summary = etl.unpackdict(aggregated_summary, 'call_info')
         aggregated_summary = etl.unpackdict(aggregated_summary, 'creator_data')
 
