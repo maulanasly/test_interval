@@ -79,7 +79,7 @@ class Model():
     class Rooms(Base, BaseModel):
         __tablename__ = 'rooms'
         room_id = sq.Column(sq.String(32), primary_key=True)
-        create_at = sq.Column(sq.TIMESTAMP)
+        created_at = sq.Column(sq.TIMESTAMP)
         end_time = sq.Column(sq.TIMESTAMP)
         creator = sq.Column(UUID())
 
@@ -181,18 +181,21 @@ def get_initiated_time_interval(summaries):
     return final_summaries
 
 
-def find_creator_and_create_at(summaries):
-    initiated_time_list = {}
+def get_room_creation_info(summaries):
+    initiated_times = {}
+    end_times = []
     for summary in summaries:
         for user_id, participant_summary in summary.iteritems():
             initiated_time = participant_summary.get('initiatedTime', 0)
+            end_times.append(participant_summary.get('leaveTime'))
             if initiated_time == 0:
                 continue
-            initiated_time_list[initiated_time] = user_id
-    index = min(initiated_time_list)
+            initiated_times[initiated_time] = user_id
+    index = min(initiated_times)
     return {
-        'creator': initiated_time_list[index],
-        'create_at': date_to_timestr(index)
+        'creator': initiated_times[index],
+        'created_at': date_to_timestr(index),
+        'end_time': date_to_timestr(max(end_times))
     }
 
 
@@ -242,45 +245,29 @@ def format_interval(user_interval):
     ]
 
 
+def rowgenerator(row):
+    for participant_id, summary_items in row[1].iteritems():
+        for interval in summary_items['interval']:
+            start_time, end_time = interval
+            yield [row[0], participant_id, start_time, end_time, summary_items['role']]
+
+
 def storing_data_preparation(data):
-    participations_data = etl.cut(
-        data,
-        'room_id',
-        'summary'
+    participations = etl.rowmapmany(
+        etl.cut(
+            data,
+            'room_id',
+            'summary'
+        ),
+        rowgenerator,
+        header=['room_id', 'participant_id', 'start_time', 'end_time', 'role']
     )
-    participations = []
-    participations_data = etl.data(participations_data)
-    for (room_id, summary) in participations_data:
-        for participant_id, summary_items in summary.iteritems():
-            for interval in summary_items['interval']:
-                start_time, end_time = interval
-                participations.append(
-                    {
-                        'room_id': room_id,
-                        'participant_id': participant_id,
-                        'start_time': start_time,
-                        'end_time': end_time,
-                        'role': summary_items['role']
-                    }
-                )
     rooms = etl.cut(
         data,
         'room_id',
-        'create_at',
+        'created_at',
         'end_time',
         'creator'
-    )
-    participations = etl.fromdicts(
-        participations,
-        header=[
-            'room_id',
-            'participant_id',
-            'start_time',
-            'end_time',
-            'role',
-            # 'init_time',
-            # 'eason_for_leaving'
-        ]
     )
     return (rooms, participations)
 
@@ -331,7 +318,7 @@ if __name__ == "__main__":
         aggregations = OrderedDict()
         aggregations['summary'] = ('participants', 'timestamp_ms'), grouping_summary_by_room_id
         aggregations['initiated_time'] = ('participants', 'timestamp_ms'), get_initiated_time_interval
-        aggregations['creator_data'] = ('participants'), find_creator_and_create_at
+        aggregations['creation_data'] = ('participants'), get_room_creation_info
         aggregated_summary = etl.aggregate(
             converted_data,
             key=('room_id'),
@@ -355,9 +342,7 @@ if __name__ == "__main__":
             ],
             header=['id', 'external_id']
         )
-        aggregated_summary = etl.addfield(aggregated_summary, 'call_info', lambda r: get_summary_creation(r['summary']))
-        aggregated_summary = etl.unpackdict(aggregated_summary, 'call_info')
-        aggregated_summary = etl.unpackdict(aggregated_summary, 'creator_data')
+        aggregated_summary = etl.unpackdict(aggregated_summary, 'creation_data')
 
         file_name = 'datasets-%s.csv' % datetime.now().strftime('%Y%m%d%H%M%S')
         directory = 'csv'
@@ -387,13 +372,3 @@ if __name__ == "__main__":
         loader.store_to_db(dBConnection.connect(**config), tablename='rooms', data=rooms)
         loader.store_to_db(dBConnection.connect(**config), tablename='participations', data=participations)
         logging.info('This %s has been stored' % file_name)
-        # TODO:
-        # For each roomId and participants get all the interval associated with them
-        #   - Loop for each summary, start with empty summary
-        #   - Filling leave_time with timestamp_str if not available and there is joinTime in it
-        #   - Create user_id field every time it's found one in the summary and
-        #   - Merge the interval that are found using the interval library
-        #   - Keep an array of the initTime per user
-        # Make a csv with the interval per participants (It will have column of full summary, therapistA, therapistB, and patient)
-        # Show this in readable time and skip days, month and years
-        # Make other column for initTime
